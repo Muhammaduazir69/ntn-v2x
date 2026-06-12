@@ -1,40 +1,43 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
- * Copyright (c) 2026 Muhammad Uzair (ns3-ntn-toolkit)
+ * Copyright (c) 2026 Muhammad Uzair (ns3-ntn-toolkit, W7)
  *
- * ntn-v2x-leo-relay-traffic — REAL V2X safety-message traffic from a vehicle
- * with a poor direct view of the LEO, relayed through a neighbour vehicle
- * that has a clear sky. The data plane is a genuine 2-hop forward:
+ * ntn-v2x-leo-relay-traffic — a shadowed vehicle (veh0) relays its basic-safety
+ * messages to a ground server through a peer vehicle (veh1) and a LEO satellite:
+ * veh0 --V2V--> veh1 --uplink--> LEO --feeder--> server. Real UDP BSMs are
+ * forwarded THROUGH the relay nodes (real Ipv4 routing); each hop's propagation
+ * delay is the real slant range / c, and a hop carries traffic only while it is
+ * in contact — the V2V hop within range, the uplink above the minimum elevation.
+ * The contact gate is driven by the live geometry, NOT a closed-form SINR /
+ * sigmoid; the V2xLeoRelay engine logs when veh0 must relay vs go direct.
+ * Delivered BSM rate / latency / jitter / loss are MEASURED end-to-end by
+ * NtnOranSink from the in-band NtnOranPayloadHeader (WS1 application suite).
  *
- *     veh0 (shadowed) --V2V--> veh1 (relay) --uplink--> LEO --feeder--> server
+ * NOTE (simplified link gates): this example deliberately uses binary
+ * geometry gates with an FSPL-equivalent fade margin (--fadeMarginDb shrinks
+ * the V2V contact range) and elevation hysteresis (--gateHysteresisDeg stops
+ * uplink flapping); the real-PHY V2X baseline is ntn-v2x-rural-highway.
+ * Vehicles follow the same SUMO-format FCD trace source as the other v2x
+ * examples (synthetic east-bound highway when no SUMO trace is supplied).
  *
- * IPv4 global routing forwards veh0's UDP basic-safety messages (BSMs) hop by
- * hop to the ground server. The V2V link's RateErrorModel degrades with the
- * inter-vehicle distance (5.9 GHz FSPL) and the veh1->LEO uplink with the
- * pass geometry, so when the relay vehicle drifts out of V2V range the
- * delivered BSM rate collapses. A V2xLeoRelay object is evaluated each second
- * and its decision (direct-to-LEO vs relay-via-peer, with the direct/relay
- * SNRs) is logged alongside the real delivery — so the routing choice and the
- * goodput both come from the geometry, nothing hardcoded.
- *
- * Quick test:  --simSeconds=120 --bsmHz=10
+ * Quick test:  --simSeconds=60 --bsmHz=10
  */
 #include "ns3/applications-module.h"
+#include "ns3/ntn-tr38811-mobility-model.h"
+#include "ns3/sgp4-mobility-model.h"
+#include "ns3/walker-constellation.h"
 #include "ns3/command-line.h"
 #include "ns3/constant-position-mobility-model.h"
-#include "ns3/constant-velocity-mobility-model.h"
 #include "ns3/core-module.h"
+#include "ns3/ntn-v2x-helper.h"
+#include "ns3/sumo-traci-bridge.h"
 #include "ns3/error-model.h"
-#include "ns3/flow-monitor-helper.h"
-#include "ns3/internet-stack-helper.h"
-#include "ns3/ipv4-address-helper.h"
-#include "ns3/ipv4-global-routing-helper.h"
-#include "ns3/point-to-point-channel.h"
-#include "ns3/point-to-point-helper.h"
-
+#include "ns3/ntn-oran-application.h"
+#include "ns3/ntn-oran-sink.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
 #include "ns3/v2x-leo-relay.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -45,23 +48,19 @@ NS_LOG_COMPONENT_DEFINE("NtnV2xLeoRelayTraffic");
 namespace
 {
 constexpr double kC = 299792458.0;
-
 Ptr<ntnv2x::V2xLeoRelay> g_relay;
-Ptr<MobilityModel> g_veh0; // shadowed vehicle (source)
-Ptr<MobilityModel> g_veh1; // relay vehicle
-Ptr<MobilityModel> g_sat;
-Ptr<RateErrorModel> g_emV2v;    // veh0 -> veh1 link
-Ptr<RateErrorModel> g_emUplink; // veh1 -> sat link
-Ptr<PointToPointChannel> g_chV2v;
-Ptr<PointToPointChannel> g_chUplink;
-Ptr<PacketSink> g_sink;
+Ptr<MobilityModel> g_veh0, g_veh1, g_sat;
+Ptr<RateErrorModel> g_emV2v, g_emUplink;
+Ptr<PointToPointChannel> g_chV2v, g_chUplink;
+Ptr<NtnOranSink> g_sink;
+Ptr<ntnv2x::SumoTraciBridge> g_bridge;
 uint64_t g_lastRx = 0;
-double g_v2vEirpDbm = 23.0;  // realistic 5.9 GHz C-V2X (≈23 dBm, ~1 km range)
-double g_v2vFreqHz = 5.9e9;
-double g_upEirpDbm = 90.0;   // vehicle-roof terminal + LEO antenna
-double g_upFreqHz = 2.0e9;
-double g_noiseDbm = -95.0;
-double g_minElev = 5.0;
+double g_maxV2vRangeM = 1500.0;
+double g_minElev = 10.0;
+double g_simTime = 60.0;
+double g_fadeMarginDb = 3.0;
+double g_gateHystDeg = 2.0;
+bool g_uplinkUp = false;
 
 double
 Dist(const Vector& a, const Vector& b)
@@ -74,40 +73,37 @@ double
 ElevDeg(const Vector& u, const Vector& s)
 {
     const Vector d(s.x - u.x, s.y - u.y, s.z - u.z);
-    return std::atan2(d.z, std::max(std::sqrt(d.x * d.x + d.y * d.y), 1e-3)) *
-           180.0 / M_PI;
-}
-
-double
-FsplDb(double dM, double fHz)
-{
-    return 20.0 * std::log10(std::max(dM, 1.0)) +
-           20.0 * std::log10(fHz / 1e9) + 32.45;
-}
-
-double
-SnrToPer(double snrDb)
-{
-    return 1.0 / (1.0 + std::exp(0.8 * (snrDb - 6.0)));
+    return std::atan2(d.z, std::max(std::sqrt(d.x * d.x + d.y * d.y), 1e-3)) * 180.0 / M_PI;
 }
 
 void
 Tick()
 {
-    // V2V hop quality (5.9 GHz, degrades with inter-vehicle distance).
+    if (Simulator::Now().GetSeconds() >= g_simTime)
+    {
+        return;
+    }
+    if (g_bridge)
+    {
+        g_bridge->Step(); // advance both vehicles along the FCD trace
+    }
     const double dV2v = Dist(g_veh0->GetPosition(), g_veh1->GetPosition());
-    const double snrV2v = g_v2vEirpDbm - FsplDb(dV2v, g_v2vFreqHz) - g_noiseDbm;
-    g_emV2v->SetRate(SnrToPer(snrV2v));
-    g_chV2v->SetAttribute("Delay", TimeValue(Seconds(dV2v / kC)));
-
-    // Uplink hop quality (relay vehicle -> LEO).
     const double dUp = Dist(g_veh1->GetPosition(), g_sat->GetPosition());
     const double elevUp = ElevDeg(g_veh1->GetPosition(), g_sat->GetPosition());
-    const double snrUp = g_upEirpDbm - FsplDb(dUp, g_upFreqHz) - g_noiseDbm;
-    g_emUplink->SetRate(elevUp < g_minElev ? 1.0 : SnrToPer(snrUp));
-    g_chUplink->SetAttribute("Delay", TimeValue(Seconds(dUp / kC)));
 
-    // Exercise the V2xLeoRelay decision engine and log veh0's choice.
+    // Geometry contact gates (NOT a fabricated SINR): real range delays + a
+    // binary in-contact/out-of-contact gate on each hop. The V2V gate keeps
+    // an FSPL-equivalent fade margin (range x 10^(-margin/20)); the uplink
+    // gate has elevation hysteresis (up at minElev, down at minElev - hyst).
+    const double effV2vRange = g_maxV2vRangeM * std::pow(10.0, -g_fadeMarginDb / 20.0);
+    g_chV2v->SetAttribute("Delay", TimeValue(Seconds(dV2v / kC)));
+    g_chUplink->SetAttribute("Delay", TimeValue(Seconds(dUp / kC)));
+    g_emV2v->SetRate(dV2v <= effV2vRange ? 0.0 : 1.0);
+    g_uplinkUp = g_uplinkUp ? (elevUp >= g_minElev - g_gateHystDeg)
+                            : (elevUp >= g_minElev);
+    g_emUplink->SetRate(g_uplinkUp ? 0.0 : 1.0);
+
+    // V2xLeoRelay decision (which path veh0 should use) — logged.
     auto decisions = g_relay->EvaluateAll();
     const ntnv2x::RelayDecision* d0 = nullptr;
     for (const auto& d : decisions)
@@ -121,12 +117,10 @@ Tick()
     const uint64_t tot = g_sink ? g_sink->GetTotalRx() : 0;
     const double bsmRx = double(tot - g_lastRx);
     g_lastRx = tot;
-    std::printf("  %6.1f  v2vRange=%7.0fm  v2vSnr=%6.1f  upSnr=%6.1f  "
-                "%-5s peer=%-5s  rx_Bps=%6.0f\n",
-                Simulator::Now().GetSeconds(), dV2v, snrV2v, snrUp,
+    std::printf("  %6.1f  v2vRange=%7.0fm  upElev=%5.1f  %-5s peer=%-5s  rx_Bps=%6.0f\n",
+                Simulator::Now().GetSeconds(), dV2v, elevUp,
                 d0 ? (d0->directToLeo ? "DIR" : "RELAY") : "?",
-                (d0 && !d0->relayPeerId.empty()) ? d0->relayPeerId.c_str() : "-",
-                bsmRx);
+                (d0 && !d0->relayPeerId.empty()) ? d0->relayPeerId.c_str() : "-", bsmRx);
     Simulator::Schedule(Seconds(1.0), &Tick);
 }
 } // namespace
@@ -134,15 +128,16 @@ Tick()
 int
 main(int argc, char* argv[])
 {
-    double simSeconds = 120.0;
-    double bsmHz = 10.0;          // basic-safety-message rate (10 Hz typical)
-    uint32_t bsmBytes = 300;      // BSM payload size
+    double simSeconds = 60.0;
+    double bsmHz = 10.0;
+    uint32_t bsmBytes = 300;
     double leoAltKm = 550.0;
     double satSpeed = 7500.0;
-    double relayDriftMps = 25.0;  // relay vehicle pulls ahead at 25 m/s
+    double relayDriftMps = 25.0;
     double maxV2vRangeM = 1500.0;
     double minDirectSnrDb = 6.0;
     double linkCapacityMbps = 20.0;
+    std::string outputDir = "ntn-v2x-leo-relay-output";
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simSeconds", "Simulation duration (s)", simSeconds);
@@ -154,33 +149,67 @@ main(int argc, char* argv[])
     cmd.AddValue("maxV2vRange", "Max V2V range for relay (m)", maxV2vRangeM);
     cmd.AddValue("minDirectSnr", "Min direct SNR before relaying (dB)", minDirectSnrDb);
     cmd.AddValue("linkCapacityMbps", "Per-hop P2P capacity (Mbps)", linkCapacityMbps);
+    cmd.AddValue("fadeMarginDb",
+                 "FSPL-equivalent fade margin applied to the V2V contact range (dB)",
+                 g_fadeMarginDb);
+    cmd.AddValue("gateHysteresisDeg",
+                 "Uplink elevation gate hysteresis (deg): up at minElev, down at minElev - hyst",
+                 g_gateHystDeg);
+    cmd.AddValue("outputDir", "Output directory", outputDir);
     cmd.Parse(argc, argv);
+    g_maxV2vRangeM = maxV2vRangeM;
+    g_simTime = simSeconds;
 
     NodeContainer nodes;
     nodes.Create(4); // 0=veh0 1=veh1 2=sat 3=server
 
-    // Mobility.
-    Ptr<ConstantPositionMobilityModel> veh0 =
-        CreateObject<ConstantPositionMobilityModel>();
-    veh0->SetPosition(Vector(0, 0, 1.5)); // shadowed (e.g. urban canyon)
+    // Vehicles ride the module's common SUMO-format FCD source (trace-replay
+    // mode; synthetic east-bound highway generated when no SUMO trace
+    // exists), exactly like ntn-v2x-rural-highway — one mobility source for
+    // all four v2x examples instead of a hand-rolled constant-velocity line.
+    const std::string tracePath = "/tmp/ntn-v2x-leo-relay-fcd.csv";
+    // Short road segment: the generator spaces vehicles roadLength/nVehicles
+    // apart, so 800 m keeps the platoon pair inside V2V range (~1.06 km
+    // effective at the 3 dB fade margin) while their speed difference makes
+    // the V2V contact genuinely come and go during the run.
+    ntnv2x::NtnV2xHelper::WriteSyntheticFcdCsv(tracePath, 2, 800.0, simSeconds, 1.0,
+                                               relayDriftMps - 5.0, relayDriftMps + 5.0);
+    g_bridge = CreateObject<ntnv2x::SumoTraciBridge>();
+    if (!g_bridge->LoadFcdTrace(tracePath))
+    {
+        NS_FATAL_ERROR("could not load synthetic FCD trace " << tracePath);
+    }
+    Ptr<ConstantPositionMobilityModel> veh0 = CreateObject<ConstantPositionMobilityModel>();
+    veh0->SetPosition(Vector(0, 0, 1.5));
     nodes.Get(0)->AggregateObject(veh0);
     g_veh0 = veh0;
-
-    Ptr<ConstantVelocityMobilityModel> veh1 =
-        CreateObject<ConstantVelocityMobilityModel>();
-    veh1->SetPosition(Vector(50, 0, 1.5)); // starts 50 m ahead
-    veh1->SetVelocity(Vector(relayDriftMps, 0, 0)); // pulls ahead, V2V range grows
+    g_bridge->RegisterVehicle("veh0", veh0);
+    Ptr<ConstantPositionMobilityModel> veh1 = CreateObject<ConstantPositionMobilityModel>();
+    veh1->SetPosition(Vector(50, 0, 1.5));
     nodes.Get(1)->AggregateObject(veh1);
     g_veh1 = veh1;
-
-    Ptr<ConstantVelocityMobilityModel> sat =
-        CreateObject<ConstantVelocityMobilityModel>();
-    sat->SetPosition(Vector(-0.5 * satSpeed * simSeconds, 0, leoAltKm * 1000.0));
-    sat->SetVelocity(Vector(satSpeed, 0, 0));
+    g_bridge->RegisterVehicle("veh1", veh1);
+    // Real SGP4 orbit projected into the scenario's local ENU frame: the
+    // satellite passes overhead near t=0 and recedes with genuine orbital
+    // dynamics (no straight-line placeholder).
+    ns3::ntncon::WalkerConfig wcfgSat;
+    wcfgSat.num_planes = 1;
+    wcfgSat.total_sats = 80;
+    wcfgSat.altitude_km = leoAltKm;
+    wcfgSat.inclination_deg = 53.0;
+    wcfgSat.epoch_unix_s = 1735689600.0;
+    const auto satElements = ns3::ntncon::WalkerConstellation::BuildDelta(wcfgSat);
+    Ptr<ns3::ntncon::Sgp4MobilityModel> satSgp4 =
+        CreateObject<ns3::ntncon::Sgp4MobilityModel>();
+    satSgp4->SetElements(satElements[0]);
+    double satSubLat, satSubLon, satSubAlt;
+    satSgp4->GetGeodetic(satSubLat, satSubLon, satSubAlt);
+    Ptr<NtnEnuProjectionMobilityModel> sat = CreateObject<NtnEnuProjectionMobilityModel>();
+    sat->SetSource(satSgp4);
+    sat->SetReference(satSubLat, satSubLon, 0.0);
     nodes.Get(2)->AggregateObject(sat);
     g_sat = sat;
 
-    // V2xLeoRelay decision engine.
     g_relay = CreateObject<ntnv2x::V2xLeoRelay>();
     g_relay->SetSatellite(sat);
     g_relay->SetMaxV2vRangeM(maxV2vRangeM);
@@ -191,15 +220,12 @@ main(int argc, char* argv[])
     InternetStackHelper internet;
     internet.Install(nodes);
 
-    // 2-hop relay topology: veh0 -- veh1 -- sat -- server.
     PointToPointHelper p2p;
-    p2p.SetDeviceAttribute(
-        "DataRate",
-        DataRateValue(DataRate(static_cast<uint64_t>(linkCapacityMbps * 1e6))));
+    p2p.SetDeviceAttribute("DataRate",
+                           DataRateValue(DataRate(static_cast<uint64_t>(linkCapacityMbps * 1e6))));
     p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(10)));
-
     Ipv4AddressHelper ipv4;
-    // veh0 <-> veh1 (V2V)
+
     NetDeviceContainer dV2v = p2p.Install(NodeContainer(nodes.Get(0), nodes.Get(1)));
     g_emV2v = CreateObject<RateErrorModel>();
     g_emV2v->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
@@ -209,7 +235,6 @@ main(int argc, char* argv[])
     ipv4.SetBase("10.60.1.0", "255.255.255.0");
     ipv4.Assign(dV2v);
 
-    // veh1 <-> sat (uplink)
     NetDeviceContainer dUp = p2p.Install(NodeContainer(nodes.Get(1), nodes.Get(2)));
     g_emUplink = CreateObject<RateErrorModel>();
     g_emUplink->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
@@ -219,64 +244,46 @@ main(int argc, char* argv[])
     ipv4.SetBase("10.60.2.0", "255.255.255.0");
     ipv4.Assign(dUp);
 
-    // sat <-> server (feeder)
-    NetDeviceContainer dFeeder =
-        p2p.Install(NodeContainer(nodes.Get(2), nodes.Get(3)));
+    NetDeviceContainer dFeeder = p2p.Install(NodeContainer(nodes.Get(2), nodes.Get(3)));
     ipv4.SetBase("10.60.3.0", "255.255.255.0");
     Ipv4InterfaceContainer iFeeder = ipv4.Assign(dFeeder);
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-    // veh0 streams BSMs to the ground server (via veh1 + sat).
     const uint16_t port = 7600;
-    PacketSinkHelper sinkHelper(
-        "ns3::UdpSocketFactory",
-        InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer sinkApp = sinkHelper.Install(nodes.Get(3));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(simSeconds));
-    g_sink = DynamicCast<PacketSink>(sinkApp.Get(0));
+    g_sink = CreateObject<NtnOranSink>();
+    g_sink->SetAttribute("Local",
+                         AddressValue(InetSocketAddress(Ipv4Address::GetAny(), port)));
+    nodes.Get(3)->AddApplication(g_sink);
+    g_sink->SetStartTime(Seconds(0.0));
+    g_sink->SetStopTime(Seconds(simSeconds));
 
-    const double bsmRateBps = bsmHz * bsmBytes * 8.0;
-    OnOffHelper onoff("ns3::UdpSocketFactory",
-                      InetSocketAddress(iFeeder.GetAddress(1), port));
-    onoff.SetAttribute("DataRate", DataRateValue(DataRate(uint64_t(bsmRateBps))));
-    onoff.SetAttribute("PacketSize", UintegerValue(bsmBytes));
-    onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-    onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    ApplicationContainer src = onoff.Install(nodes.Get(0));
-    src.Start(Seconds(1.0));
-    src.Stop(Seconds(simSeconds));
+    // BSM cadence: deterministic periodic V2X messages (5QI 82, URLLC class).
+    Ptr<NtnOranApplication> src = CreateObject<NtnOranApplication>();
+    src->SetRemote(InetSocketAddress(iFeeder.GetAddress(1), port));
+    src->SetProfile(NtnOranApplication::URLLC_PERIODIC);
+    src->SetAttribute("PacketSize", UintegerValue(bsmBytes));
+    src->SetAttribute("Period", TimeValue(Seconds(1.0 / bsmHz)));
+    src->SetFlowIdentity(/*5qi*/ 82, /*sst*/ 2, /*sd*/ 0x000001, /*src*/ 0, /*dst*/ 3);
+    nodes.Get(0)->AddApplication(src);
+    src->SetStartTime(Seconds(1.0));
+    src->SetStopTime(Seconds(simSeconds));
 
-    FlowMonitorHelper fmHelper;
-    Ptr<FlowMonitor> monitor = fmHelper.InstallAll();
-
-    std::printf("# ntn-v2x-leo-relay-traffic (veh0 --V2V--> veh1 --uplink--> LEO --> server)\n");
-    std::printf("#   sim=%.0fs bsm=%.0fHz x %uB leoAlt=%.0fkm relayDrift=%.0fm/s "
-                "maxV2vRange=%.0fm\n",
+    std::printf("# ntn-v2x-leo-relay-traffic (veh0 --V2V--> veh1 --uplink--> LEO --> server)\n"
+                "#   sim=%.0fs bsm=%.0fHz x %uB leoAlt=%.0fkm relayDrift=%.0fm/s maxV2vRange=%.0fm\n",
                 simSeconds, bsmHz, bsmBytes, leoAltKm, relayDriftMps, maxV2vRangeM);
 
     Simulator::Schedule(Seconds(2.0), &Tick);
-    Simulator::Stop(Seconds(simSeconds + 0.1));
+    Simulator::Stop(Seconds(simSeconds + 1));
     Simulator::Run();
 
-    monitor->CheckForLostPackets();
-    const auto stats = monitor->GetFlowStats();
-    uint64_t txP = 0, rxP = 0;
-    double sumDelay = 0.0;
-    uint64_t rxForDelay = 0;
-    for (const auto& kv : stats)
-    {
-        txP += kv.second.txPackets;
-        rxP += kv.second.rxPackets;
-        sumDelay += kv.second.delaySum.GetSeconds();
-        rxForDelay += kv.second.rxPackets;
-    }
-    std::printf("# === summary ===  BSMs sent=%lu delivered=%lu PDR=%.2f%% "
-                "meanDelay=%.2fms (end-to-end veh0->server via relay)\n",
-                (unsigned long)txP, (unsigned long)rxP,
-                txP ? 100.0 * rxP / txP : 0.0,
-                rxForDelay ? (sumDelay / rxForDelay) * 1000.0 : 0.0);
+    // KPIs measured from in-band NtnOranPayloadHeader primitives at the sink.
+    const uint64_t txP = src->GetTxPackets();
+    const uint64_t rxP = g_sink->GetRxPackets();
+    std::printf("# === summary ===  BSM txPackets=%lu rxPackets=%lu PDR=%.2f%%  "
+                "mean e2e delay=%.2f ms jitter=%.3f ms (real range delays through the relay)\n",
+                (unsigned long)txP, (unsigned long)rxP, txP ? 100.0 * rxP / txP : 0.0,
+                g_sink->GetMeanDelayMs(), g_sink->GetMeanJitterMs());
     Simulator::Destroy();
     return 0;
 }
