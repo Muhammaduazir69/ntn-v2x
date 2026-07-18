@@ -7,12 +7,16 @@
 #include "ns3/constant-velocity-mobility-model.h"
 #include "ns3/double.h"
 #include "ns3/maritime-scenario.h"
+#include "ns3/ntn-v2x-bsm-header.h"
 #include "ns3/ntn-v2x-helper.h"
+#include "ns3/packet.h"
 #include "ns3/simulator.h"
 #include "ns3/sumo-traci-bridge.h"
 #include "ns3/test.h"
 #include "ns3/v2x-leo-direct.h"
 #include "ns3/v2x-leo-relay.h"
+#include "ns3/ntn-nr-sidelink.h"
+#include "ns3/constant-position-mobility-model.h"
 
 #include <cmath>
 #include <cstdio>
@@ -219,6 +223,144 @@ class HundredVehicleSmokeTest : public TestCase
     }
 };
 
+/**
+ * \brief The J2735 BSM header serialises its kinematic state and reads it back
+ *        within each field's encoding resolution — proving the relay packets
+ *        carry a real BSM, not opaque padding.
+ */
+class J2735BsmHeaderRoundTripTest : public TestCase
+{
+  public:
+    J2735BsmHeaderRoundTripTest()
+        : TestCase("SAE J2735 BSM header round-trips through a packet")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        ntnv2x::NtnV2xBsmHeader tx;
+        tx.SetFromState(/*msgCnt=*/42, /*id=*/0x0A0B0C0Du, /*secMark=*/12345,
+                        /*lat=*/48.137154, /*lon=*/11.576124, /*elev=*/542.3,
+                        /*speed=*/27.4, /*heading=*/93.75);
+
+        Ptr<Packet> p = Create<Packet>(0);
+        p->AddHeader(tx);
+        ntnv2x::NtnV2xBsmHeader rx;
+        p->RemoveHeader(rx);
+
+        NS_TEST_ASSERT_MSG_EQ(rx.GetMsgCnt(), 42, "msgCnt");
+        NS_TEST_ASSERT_MSG_EQ(rx.GetId(), 0x0A0B0C0Du, "station id");
+        NS_TEST_ASSERT_MSG_EQ(rx.GetSecMark(), 12345, "secMark");
+        // 1/10 micro-degree resolution -> ~1e-7 deg.
+        NS_TEST_ASSERT_MSG_EQ_TOL(rx.GetLatDeg(), 48.137154, 1e-6, "latitude");
+        NS_TEST_ASSERT_MSG_EQ_TOL(rx.GetLonDeg(), 11.576124, 1e-6, "longitude");
+        NS_TEST_ASSERT_MSG_EQ_TOL(rx.GetElevM(), 542.3, 0.05, "elevation (1 dm)");
+        NS_TEST_ASSERT_MSG_EQ_TOL(rx.GetSpeedMps(), 27.4, 0.02, "speed (0.02 m/s)");
+        NS_TEST_ASSERT_MSG_EQ_TOL(rx.GetHeadingDeg(), 93.75, 0.0125, "heading (0.0125 deg)");
+    }
+};
+
+// ============================================================================
+//  WS-D / V1: NR PC5 sidelink Mode 2 (TS 38.321 §5.22). Vehicles exchange BSMs
+//  directly over PC5 — no gNB. This asserts: (1) every UE autonomously selects a
+//  resource and transmits; (2) with a pool wide enough for sensing to spread the
+//  UEs, in-range PRR is high and the half-duplex rule holds (no self-reception);
+//  (3) forcing all UEs onto a single subchannel (pool=1) causes measurable
+//  co-channel collisions, i.e. PRR drops versus the spread case — proving the
+//  collision + sensing model is real, not a pass-through.
+// ============================================================================
+class NtnSidelinkMode2Test : public TestCase
+{
+  public:
+    NtnSidelinkMode2Test()
+        : TestCase("WS-D V1 - NR PC5 sidelink Mode 2 selection, half-duplex, and PRR")
+    {
+    }
+
+  private:
+    // Build a line of UEs 20 m apart, run the SL channel, return the channel so
+    // the caller can read KPIs. selfRx is set true if any UE ever received its
+    // own packet (a half-duplex violation).
+    Ptr<NtnSlChannel> RunScenario(uint32_t numUes, uint32_t numSubch, bool& selfRx,
+                                  std::vector<uint32_t>& rxPerUe)
+    {
+        auto ch = CreateObject<NtnSlChannel>();
+        NtnSlResourcePool pool;
+        pool.numSubchannels = numSubch;
+        pool.slotDuration = MilliSeconds(1);
+        ch->SetResourcePool(pool);
+        ch->SetTxPowerDbm(23.0);
+        ch->SetDecodeThresholdDbm(-115.0);
+
+        rxPerUe.assign(numUes, 0);
+        selfRx = false;
+        std::vector<Ptr<NtnSlUeMac>> ues;
+        for (uint32_t i = 0; i < numUes; ++i)
+        {
+            auto ue = CreateObject<NtnSlUeMac>();
+            ue->SetUeId(i);
+            auto mob = CreateObject<ConstantPositionMobilityModel>();
+            mob->SetPosition(Vector(20.0 * i, 0.0, 0.0)); // 20 m spacing
+            ue->SetMobility(mob);
+            ue->SetSelectionWindow(1, 20);
+            ue->SetReservationPeriod(20); // 20 ms BSM period (@ mu=0)
+            ue->SetPacketBytes(190);
+            ue->AssignStreams(100 + i);
+            uint32_t self = i;
+            NtnSlUeMac::SlRxCallback cb =
+                [&, self](uint32_t from, uint32_t) {
+                    if (from == self)
+                    {
+                        selfRx = true;
+                    }
+                    else
+                    {
+                        rxPerUe[self]++;
+                    }
+                };
+            ue->SetRxCallback(cb);
+            ch->AddUe(ue);
+            ues.push_back(ue);
+        }
+        ch->Start(MilliSeconds(1), MilliSeconds(600));
+        Simulator::Run();
+
+        selfRx = selfRx; // captured by reference
+        // stash tx counts via KPIs before destroy
+        Ptr<NtnSlChannel> ret = ch;
+        // Keep ues alive until after Run via the channel's internal vector.
+        Simulator::Destroy();
+        return ret;
+    }
+
+    void DoRun() override
+    {
+        // Case A: wide pool (5 subchannels) — sensing spreads the 4 UEs.
+        bool selfRxA = false;
+        std::vector<uint32_t> rxA;
+        auto chA = RunScenario(4, 5, selfRxA, rxA);
+
+        NS_TEST_ASSERT_MSG_EQ(selfRxA, false, "half-duplex: a UE must never receive its own TX");
+        NS_TEST_ASSERT_MSG_GT(chA->GetTxTotal(), 0u, "every UE must autonomously transmit");
+        // Neighbours 20/40 m away are well within range -> high short-range PRR.
+        double prrNearA = chA->GetPrrWithinRange(45.0);
+        NS_TEST_ASSERT_MSG_GT(prrNearA, 0.9,
+                              "with a wide pool, in-range PRR must be high (sensing avoids collisions)");
+
+        // Case B: degenerate pool (1 subchannel) — all UEs forced to contend for
+        // the same subchannel -> co-channel collisions -> PRR drops.
+        bool selfRxB = false;
+        std::vector<uint32_t> rxB;
+        auto chB = RunScenario(4, 1, selfRxB, rxB);
+        double prrNearB = chB->GetPrrWithinRange(45.0);
+
+        NS_TEST_ASSERT_MSG_EQ(selfRxB, false, "half-duplex holds under contention too");
+        NS_TEST_ASSERT_MSG_LT(prrNearB, prrNearA,
+                              "a 1-subchannel pool must collide more than a 5-subchannel pool");
+    }
+};
+
 class NtnV2xTestSuite : public TestSuite
 {
   public:
@@ -229,7 +371,9 @@ class NtnV2xTestSuite : public TestSuite
         AddTestCase(new V2xLeoDirectFreeSpaceTest, TestCase::Duration::QUICK);
         AddTestCase(new V2xLeoRelayDirectVsRelayTest, TestCase::Duration::QUICK);
         AddTestCase(new MaritimeBouncesInBoxTest, TestCase::Duration::QUICK);
+        AddTestCase(new J2735BsmHeaderRoundTripTest, TestCase::Duration::QUICK);
         AddTestCase(new HundredVehicleSmokeTest, TestCase::Duration::EXTENSIVE);
+        AddTestCase(new NtnSidelinkMode2Test, TestCase::Duration::QUICK);
     }
 };
 

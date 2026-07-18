@@ -40,8 +40,10 @@
 #include "ns3/sumo-traci-bridge.h"
 #include "ns3/error-model.h"
 #include "ns3/ntn-oran-application.h"
+#include "ns3/ntn-v2x-bsm-header.h"
 #include "ns3/ntn-oran-sink.h"
 #include "ns3/internet-module.h"
+#include "ns3/ipv4.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/v2x-leo-relay.h"
 
@@ -57,9 +59,13 @@ namespace
 constexpr double kC = 299792458.0;
 Ptr<ntnv2x::V2xLeoRelay> g_relay;
 Ptr<MobilityModel> g_veh0, g_veh1, g_sat;
-Ptr<RateErrorModel> g_emV2v, g_emUplink;
-Ptr<PointToPointChannel> g_chV2v, g_chUplink;
+Ptr<RateErrorModel> g_emV2v, g_emUplink, g_emDirect;
+Ptr<PointToPointChannel> g_chV2v, g_chUplink, g_chDirect;
+Ptr<Ipv4> g_veh0Ipv4;
+uint32_t g_ifV2v = 1, g_ifDirect = 2;
 Ptr<NtnOranSink> g_sink;
+Ptr<MobilityModel> g_veh0Mob;
+uint8_t g_bsmCnt = 0;
 Ptr<ntnv2x::SumoTraciBridge> g_bridge;
 uint64_t g_lastRx = 0;
 double g_maxV2vRangeM = 1500.0;
@@ -123,6 +129,31 @@ Tick()
                                d0->v2vRangeM <= g_maxV2vRangeM;
     g_emV2v->SetRate(relaySelected ? 0.0 : 1.0);
 
+    // GAP V2 FIX: steer veh0's PATH to match the engine's decision. When it
+    // chooses direct, bring veh0's direct-to-sat interface UP and the V2V one
+    // DOWN (and vice-versa) and recompute routing, so packets follow the chosen
+    // egress instead of the fixed V2V chain. This is what makes "direct" deliver
+    // instead of dropping every packet.
+    const bool directSelected = d0 && d0->directToLeo;
+    const double directSlant = Dist(g_veh0->GetPosition(), g_sat->GetPosition());
+    g_chDirect->SetAttribute("Delay", TimeValue(Seconds(directSlant / kC)));
+    if (g_veh0Ipv4)
+    {
+        const bool v2vUpNow = g_veh0Ipv4->IsUp(g_ifV2v);
+        const bool directUpNow = g_veh0Ipv4->IsUp(g_ifDirect);
+        const bool wantV2vUp = !directSelected;
+        const bool wantDirectUp = directSelected;
+        if (v2vUpNow != wantV2vUp || directUpNow != wantDirectUp)
+        {
+            wantV2vUp ? g_veh0Ipv4->SetUp(g_ifV2v) : g_veh0Ipv4->SetDown(g_ifV2v);
+            wantDirectUp ? g_veh0Ipv4->SetUp(g_ifDirect) : g_veh0Ipv4->SetDown(g_ifDirect);
+            Ipv4GlobalRoutingHelper::RecomputeRoutingTables();
+        }
+        // The direct hop's own link budget still gates delivery: up only when
+        // veh0's direct LEO link clears the engine's SNR threshold.
+        g_emDirect->SetRate(directSelected ? 0.0 : 1.0);
+    }
+
     // Uplink hop carries traffic when the relay engine's chosen LEO link (the
     // relay peer's link when relaying, or veh0's own link when direct) clears
     // the minimum direct-SNR threshold the engine was configured with.
@@ -159,7 +190,10 @@ main(int argc, char* argv[])
     double minDirectSnrDb = 6.0;
     double veh0BlockageDb = 14.0; // veh0 is the shadowed (NLOS) vehicle that relays
     double linkCapacityMbps = 20.0;
-    std::string fcdTrace = "";
+    // Default to the shipped synthetic FCD fixture so the example runs out of
+    // the box (resolves from the ns-3 root, which is the run cwd); override with
+    // --fcdTrace=<path> to replay a real SUMO-exported trace.
+    std::string fcdTrace = "contrib/ntn-v2x/traces/leo-relay-fcd.csv";
     std::string outputDir = "ntn-v2x-leo-relay-output";
 
     CommandLine cmd(__FILE__);
@@ -285,6 +319,27 @@ main(int argc, char* argv[])
     ipv4.SetBase("10.60.3.0", "255.255.255.0");
     Ipv4InterfaceContainer iFeeder = ipv4.Assign(dFeeder);
 
+    // GAP V2 FIX (the "direct decision -> PDR 0" bug): give veh0 a DIRECT link
+    // to the satellite, so when the relay engine decides direct-to-LEO the
+    // packets have a path that exists. Previously the only veh0 egress was the
+    // V2V link, so a "direct" decision closed the V2V gate and dropped every
+    // packet -- the engine choosing the BETTER link produced TOTAL loss.
+    NetDeviceContainer dDirect = p2p.Install(NodeContainer(nodes.Get(0), nodes.Get(2)));
+    g_emDirect = CreateObject<RateErrorModel>();
+    g_emDirect->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+    g_emDirect->SetRate(0.0);
+    dDirect.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(g_emDirect));
+    g_chDirect = DynamicCast<PointToPointChannel>(dDirect.Get(0)->GetChannel());
+    ipv4.SetBase("10.60.4.0", "255.255.255.0");
+    ipv4.Assign(dDirect);
+    // veh0's egress interfaces: 1 = V2V (to veh1), 2 = direct (to sat). The Tick
+    // brings exactly one UP per the engine's decision and recomputes routing, so
+    // veh0's packets follow the CHOSEN path -- routing tracks the decision, not
+    // a fixed chain.
+    g_veh0Ipv4 = nodes.Get(0)->GetObject<Ipv4>();
+    g_ifV2v = 1;
+    g_ifDirect = 2;
+
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     const uint16_t port = 7600;
@@ -295,13 +350,40 @@ main(int argc, char* argv[])
     g_sink->SetStartTime(Seconds(0.0));
     g_sink->SetStopTime(Seconds(simSeconds));
 
-    // BSM cadence: deterministic periodic V2X messages (5QI 82, URLLC class).
+    // BSM cadence: periodic V2X safety messages (5QI 82, URLLC class), each
+    // carrying a REAL SAE J2735 BSM Part I populated from veh0's live mobility
+    // (position + speed + heading) rather than opaque padding. The J2735 core
+    // fills the packet body; the in-band NtnOranPayloadHeader is still on top,
+    // so PDR/delay/jitter stay measured end-to-end.
     Ptr<NtnOranApplication> src = CreateObject<NtnOranApplication>();
     src->SetRemote(InetSocketAddress(iFeeder.GetAddress(1), port));
     src->SetProfile(NtnOranApplication::URLLC_PERIODIC);
     src->SetAttribute("PacketSize", UintegerValue(bsmBytes));
     src->SetAttribute("Period", TimeValue(Seconds(1.0 / bsmHz)));
     src->SetFlowIdentity(/*5qi*/ 82, /*sst*/ 2, /*sd*/ 0x000001, /*src*/ 0, /*dst*/ 3);
+    g_veh0Mob = nodes.Get(0)->GetObject<MobilityModel>();
+    src->SetPayloadBuilder(
+        MakeCallback(+[](Buffer::Iterator it, uint32_t bodyBytes) {
+            // Fill the leading J2735 BSM core; the rest stays padding (Part II).
+            ntnv2x::NtnV2xBsmHeader bsm;
+            const Vector p = g_veh0Mob ? g_veh0Mob->GetPosition() : Vector(0, 0, 0);
+            const Vector v = g_veh0Mob ? g_veh0Mob->GetVelocity() : Vector(0, 0, 0);
+            // ENU/local metres -> pseudo lat/lon degrees for the BSM fields; the
+            // absolute datum is arbitrary for a relay-latency study, the point is
+            // that the values move with the vehicle.
+            const double latDeg = p.y / 111320.0;
+            const double lonDeg = p.x / 111320.0;
+            const double speed = std::sqrt(v.x * v.x + v.y * v.y);
+            const double heading = std::fmod(std::atan2(v.x, v.y) * 180.0 / M_PI + 360.0, 360.0);
+            const uint16_t secMark =
+                static_cast<uint16_t>(std::llround(Simulator::Now().GetMilliSeconds()) % 60000);
+            bsm.SetFromState(g_bsmCnt++, /*stationId=*/0x00000001u, secMark, latDeg, lonDeg, p.z,
+                             speed, heading);
+            if (bodyBytes >= bsm.GetSerializedSize())
+            {
+                bsm.Serialize(it);
+            }
+        }));
     nodes.Get(0)->AddApplication(src);
     src->SetStartTime(Seconds(1.0));
     src->SetStopTime(Seconds(simSeconds));
