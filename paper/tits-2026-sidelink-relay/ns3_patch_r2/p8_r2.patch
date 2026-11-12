@@ -1,0 +1,222 @@
+--- orig/ntn-v2x-canyon-relay.cc	2026-11-05 06:43:58.691892739 +0500
++++ ntn-v2x-canyon-relay.cc	2026-11-05 06:43:58.780341406 +0500
+@@ -60,6 +60,8 @@
+ #include "ns3/orbital-elements.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <deque>
+ #include <cmath>
+ #include <fstream>
+ #include <map>
+@@ -76,6 +78,7 @@
+ constexpr double kAnt = 1.5;
+ constexpr uint32_t kNoRelay = 0xFFFFFFFF;
+ constexpr uint32_t kAny = 0xFFFFFFFE;
++constexpr uint32_t kList = 0xFFFFFFFD; // the broadcast names a list of neighbors (g_named)
+ constexpr uint16_t kPort = 7000;
+ 
+ struct Veh
+@@ -120,6 +123,19 @@
+ double g_nbAge = 1.0;      // neighbor table entries age out after this time (s)
+ double g_kappa = 1.0;      // anyp: expected number of forwards
+ double g_traceDt = 1.0;
++uint32_t g_relayK = 1;     // relayk, relayrand, randk: how many neighbors a message names
++bool g_ulPrio = false;     // uplink discipline: a vehicle's own messages before forwards, instead of first come first served
++double g_vMin = 6.0, g_vMax = 14.0; // constant-speed range (m/s)
++std::map<uint32_t, std::vector<uint32_t>> g_named; // per source, the neighbors named by its current message
++struct UlItem
++{
++    uint32_t i;
++    Ptr<Packet> p;
++    uint16_t port;
++    double t0;
++};
++std::map<int, std::array<std::deque<UlItem>, 2>> g_ulQ; // per satellite: own messages, forwards
++std::map<int, bool> g_ulBusy;
+ bool g_useTrace = false;
+ double g_gapEvery = 0, g_gapLen = 0;
+ std::vector<float> g_rasterL, g_rasterR; // facades from a file, per meter along the street
+@@ -334,6 +350,7 @@
+     uint32_t pick = kNoRelay, pickFar = kNoRelay, pickLb = kNoRelay, pickBest = kNoRelay;
+     double bestD = 1e18, bestFar = 1e18, bestLb = 1e18, bestQ = 2.0, bestQD = 1e18;
+     std::vector<uint32_t> cand;
++    std::vector<std::pair<double, uint32_t>> byD;
+     std::vector<std::pair<uint32_t, double>> apartQ; // hybrid: apart neighbors and the score of their lane
+     const bool needApart = g_policy == "blindfar" || g_policy == "blindbest" || g_policy == "hybrid";
+     for (const auto& [j, n] : g_v[src].nb)
+@@ -348,7 +365,7 @@
+         {
+             continue;
+         }
+-        if (g_policy == "relay" && !n.up)
++        if ((g_policy == "relay" || g_policy == "relayk" || g_policy == "relayrand") && !n.up)
+         {
+             continue;
+         }
+@@ -407,12 +424,37 @@
+             pickLb = j;
+         }
+         cand.push_back(j);
++        byD.emplace_back(d, j);
+         if (apart && d < bestFar)
+         {
+             bestFar = d;
+             pickFar = j;
+         }
+     }
++    if (g_policy == "relayk" && !cand.empty())
++    {
++        std::sort(byD.begin(), byD.end());
++        auto& nm = g_named[src];
++        nm.clear();
++        for (uint32_t m = 0; m < g_relayK && m < byD.size(); ++m)
++        {
++            nm.push_back(byD[m].second);
++        }
++        return kList;
++    }
++    if ((g_policy == "relayrand" || g_policy == "randk") && !cand.empty())
++    {
++        static Ptr<UniformRandomVariable> ul = CreateObject<UniformRandomVariable>();
++        auto& nm = g_named[src];
++        nm.clear();
++        for (uint32_t m = 0; m < g_relayK && !cand.empty(); ++m)
++        {
++            const uint32_t idx = ul->GetInteger(0, cand.size() - 1);
++            nm.push_back(cand[idx]);
++            cand.erase(cand.begin() + idx);
++        }
++        return kList;
++    }
+     if ((g_policy == "rand2" || g_policy == "rand3") && !cand.empty())
+     {
+         static Ptr<UniformRandomVariable> uk = CreateObject<UniformRandomVariable>();
+@@ -507,6 +549,52 @@
+     v.sock->SendTo(p, 0, InetSocketAddress(g_srvAddr, port));
+ }
+ 
++void UlServe(int sat);
++
++void
++UlDone(uint32_t i, Ptr<Packet> p, uint16_t port, double t0, int sat)
++{
++    UlFinish(i, p, port, t0);
++    UlServe(sat);
++}
++
++/// Strict priority, not preemptive: own messages first, each class in arrival order; a message that has waited too long is dropped.
++void
++UlServe(int sat)
++{
++    auto& q = g_ulQ[sat];
++    const double now = Simulator::Now().GetSeconds();
++    for (auto& cls : q)
++    {
++        while (!cls.empty())
++        {
++            UlItem it = cls.front();
++            cls.pop_front();
++            if (now - it.t0 > g_ulMaxQ)
++            {
++                ++g_ulDropQ;
++                continue;
++            }
++            g_ulBusy[sat] = true;
++            const double tx = (it.p->GetSize() + 28) * 8.0 / (g_ulKbps * 1e3);
++            Simulator::Schedule(Seconds(tx), &UlDone, it.i, it.p, it.port, it.t0, sat);
++            return;
++        }
++    }
++    g_ulBusy[sat] = false;
++}
++
++void
++UlEnqueue(uint32_t i, Ptr<Packet> p, uint16_t port, double t0)
++{
++    const int sat = g_v[i].sat;
++    g_ulQ[sat][port == kPort ? 0 : 1].push_back({i, p, port, t0});
++    if (!g_ulBusy[sat])
++    {
++        UlServe(sat);
++    }
++}
++
+ void
+ UlSend(uint32_t i, Ptr<Packet> p, uint16_t port)
+ {
+@@ -521,6 +609,11 @@
+     const double now = Simulator::Now().GetSeconds();
+     const double rtt = 2.0 * 2.0 * v.slant / kC; // service and feeder link, both ways
+     double t = now + g_grantRtt * rtt;
++    if (g_ulPrio && g_ulKbps > 0)
++    {
++        Simulator::Schedule(Seconds(t - now), &UlEnqueue, i, p, port, now);
++        return;
++    }
+     if (g_ulKbps > 0)
+     {
+         double& busy = g_satBusy[v.sat];
+@@ -560,13 +653,14 @@
+     const bool canRelay = g_policy == "relay" || g_policy == "blind" || g_policy == "blindfar" ||
+                           g_policy == "blindlb" || g_policy == "random" || g_policy == "blindbest" ||
+                           g_policy == "randpersist" || g_policy == "rand2" || g_policy == "rand3" ||
+-                          g_policy == "roundrobin" || g_policy == "hybrid";
++                          g_policy == "roundrobin" || g_policy == "hybrid" || g_policy == "relayk" ||
++                          g_policy == "relayrand" || g_policy == "randk";
+     if (!v.up && canRelay)
+     {
+         relay = ChooseRelay(i);
+         v.relayAsked += relay != kNoRelay;
+     }
+-    else if (!v.up && (g_policy == "anyfwd" || g_policy == "anyp"))
++    else if (!v.up && (g_policy == "anyfwd" || g_policy == "anyp" || g_policy == "anypn"))
+     {
+         relay = kAny;
+         ++v.relayAsked;
+@@ -617,18 +711,23 @@
+             return;
+         }
+         named = true;
+-        if (g_policy == "anyp")
++        if (g_policy == "anyp" || g_policy == "anypn")
+         {
+             const double now = Simulator::Now().GetSeconds();
+             uint32_t ups = 0;
+             for (const auto& [j, n] : g_v[self].nb)
+             {
+-                ups += n.up && now - n.t <= g_nbAge && std::abs(n.x - PosX(g_v[self])) <= g_maxRelay;
++                ups += (n.up || g_policy == "anypn") && now - n.t <= g_nbAge && std::abs(n.x - PosX(g_v[self])) <= g_maxRelay;
+             }
+             static Ptr<UniformRandomVariable> up = CreateObject<UniformRandomVariable>();
+             named = up->GetValue() < std::min(1.0, g_kappa / (1.0 + ups));
+         }
+     }
++    else if (tg == kList)
++    {
++        const auto& nm = g_named[from];
++        named = std::find(nm.begin(), nm.end(), self) != nm.end();
++    }
+     else if (tg != kNoRelay)
+     {
+         for (int k = 0; k < 3; ++k)
+@@ -705,6 +804,10 @@
+     cmd.AddValue("relaySetupMs", "latency of a link to a relay the source did not name last (ms)", setupMs);
+     cmd.AddValue("nbAgeS", "neighbor entries age out after this time (s)", g_nbAge);
+     cmd.AddValue("kappa", "anyp: expected number of forwards", g_kappa);
++    cmd.AddValue("relayK", "relayk, relayrand, randk: neighbors named per message", g_relayK);
++    cmd.AddValue("ulPrio", "own uplink messages before forwards", g_ulPrio);
++    cmd.AddValue("vMin", "constant speed range, low (m/s)", g_vMin);
++    cmd.AddValue("vMax", "constant speed range, high (m/s)", g_vMax);
+     std::string mobTrace, facadeFile;
+     cmd.AddValue("mobTrace", "CSV: first line dt, then one line per vehicle: x0,dir,s(0),s(dt),...", mobTrace);
+     cmd.AddValue("facadeFile", "CSV: side (0 left, 1 right),x0,x1,height", facadeFile);
+@@ -803,7 +906,7 @@
+         Veh& v = g_v[i];
+         v.x0 = u->GetValue(0, g_len);
+         v.y = lanes[i % 4] * g_width / 20.0;
+-        v.v = u->GetValue(6, 14) * (v.y < g_width / 2 ? 1 : -1);
++        v.v = u->GetValue(g_vMin, g_vMax) * (v.y < g_width / 2 ? 1 : -1);
+         v.mob = CreateObject<ConstantPositionMobilityModel>();
+         v.mob->SetPosition(Vector(v.x0, v.y, kAnt));
+         vn.Get(i)->AggregateObject(v.mob);

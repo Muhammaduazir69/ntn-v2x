@@ -1,0 +1,110 @@
+{
+ "law_suburban_30_1": {
+  "p_src_blocked": 8.542068637167661e-05,
+  "p_all_blocked": 1.903684336980131e-11,
+  "reach": 0.9999997771401264,
+  "relay_bound": 0.9999999999809631
+ },
+ "law_suburban_60_1": {
+  "p_src_blocked": 7.488179814960335e-05,
+  "p_all_blocked": 2.5083719787621292e-27,
+  "reach": 1.0,
+  "relay_bound": 1.0
+ },
+ "law_suburban_120_1": {
+  "p_src_blocked": 7.69177029766616e-05,
+  "p_all_blocked": 3.414941216683234e-42,
+  "reach": 1.0,
+  "relay_bound": 1.0
+ },
+ "law_urban_30_1": {
+  "p_src_blocked": 0.03562602271770565,
+  "p_all_blocked": 1.0366887151491841e-05,
+  "reach": 0.9997090080126644,
+  "relay_bound": 0.9999896331128485
+ },
+ "law_urban_60_1": {
+  "p_src_blocked": 0.03397557545530826,
+  "p_all_blocked": 5.9792422659172426e-09,
+  "reach": 0.9999998240135101,
+  "relay_bound": 0.9999999940207578
+ },
+ "law_urban_120_1": {
+  "p_src_blocked": 0.03414113837826754,
+  "p_all_blocked": 1.0028353061591983e-12,
+  "reach": 0.9999999999706267,
+  "relay_bound": 0.9999999999989971
+ },
+ "law_dense_30_1": {
+  "p_src_blocked": 0.2569246862697058,
+  "p_all_blocked": 0.009673364136676998,
+  "reach": 0.9623494173443403,
+  "relay_bound": 0.990326635863323
+ },
+ "law_dense_60_1": {
+  "p_src_blocked": 0.25650186107743667,
+  "p_all_blocked": 0.0022747138352910462,
+  "reach": 0.9911317842851662,
+  "relay_bound": 0.9977252861647089
+ },
+ "law_dense_120_1": {
+  "p_src_blocked": 0.2546926852232721,
+  "p_all_blocked": 0.0003913197174884495,
+  "reach": 0.9984635612242048,
+  "relay_bound": 0.9996086802825116
+ },
+ "realized_suburban_30_1": {
+  "p_src_blocked": 0.00015325481405523072,
+  "p_all_blocked": 6.084593953556928e-11,
+  "reach": 0.999999602975346,
+  "relay_bound": 0.999999999939154
+ },
+ "realized_suburban_60_1": {
+  "p_src_blocked": 0.00013574551427364333,
+  "p_all_blocked": 2.253387686799833e-25,
+  "reach": 1.0,
+  "relay_bound": 1.0
+ },
+ "realized_suburban_120_1": {
+  "p_src_blocked": 0.00014274452134503243,
+  "p_all_blocked": 2.1468527824695053e-35,
+  "reach": 1.0,
+  "relay_bound": 1.0
+ },
+ "realized_urban_30_1": {
+  "p_src_blocked": 0.026891000853260884,
+  "p_all_blocked": 3.5018420343419462e-06,
+  "reach": 0.9998697764336311,
+  "relay_bound": 0.9999964981579657
+ },
+ "realized_urban_60_1": {
+  "p_src_blocked": 0.025710034890437123,
+  "p_all_blocked": 3.9167878926611215e-10,
+  "reach": 0.9999999847655286,
+  "relay_bound": 0.9999999996083212
+ },
+ "realized_urban_120_1": {
+  "p_src_blocked": 0.025811112915191118,
+  "p_all_blocked": 1.0643327876789183e-14,
+  "reach": 0.9999999999995877,
+  "relay_bound": 0.9999999999999893
+ },
+ "realized_dense_30_1": {
+  "p_src_blocked": 0.22973243033752438,
+  "p_all_blocked": 0.007276087122386898,
+  "reach": 0.9683279930844034,
+  "relay_bound": 0.9927239128776131
+ },
+ "realized_dense_60_1": {
+  "p_src_blocked": 0.22789084991149902,
+  "p_all_blocked": 0.001627519258933061,
+  "reach": 0.9928583387197638,
+  "relay_bound": 0.998372480741067
+ },
+ "realized_dense_120_1": {
+  "p_src_blocked": 0.22688990131115386,
+  "p_all_blocked": 0.00027478231381500393,
+  "reach": 0.998788917830952,
+  "relay_bound": 0.9997252176861849
+ }
+}

@@ -1,0 +1,10 @@
+--- orig/ntn-v2x-canyon-relay.cc	2026-11-05 12:47:45.899213289 +0500
++++ ntn-v2x-canyon-relay.cc	2026-11-05 12:47:45.981350299 +0500
+@@ -317,6 +317,7 @@
+         {
+             // slant to the satellite plus its feeder hop to the gateway (taken at the same slant)
+             v.chan->SetAttribute("Delay", TimeValue(Seconds(2 * slant / kC)));
++            v.slant = slant;
+         }
+     }
+     Simulator::Schedule(Seconds(dt), &Tick, dt);

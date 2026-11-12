@@ -1,0 +1,86 @@
+[
+ {
+  "study": "cap",
+  "canyon": "dense",
+  "policy": "relay",
+  "rep": 15,
+  "same": true
+ },
+ {
+  "study": "cap",
+  "canyon": "urban",
+  "policy": "anyp",
+  "rep": 11,
+  "same": true
+ },
+ {
+  "study": "mob",
+  "canyon": "urban",
+  "policy": "anyfwd",
+  "rep": 11,
+  "same": true
+ },
+ {
+  "study": "period",
+  "canyon": "urban",
+  "policy": "random",
+  "rep": 17,
+  "same": true
+ },
+ {
+  "study": "primary",
+  "canyon": "urban",
+  "policy": "rand3",
+  "rep": 2,
+  "same": true
+ },
+ {
+  "study": "primary",
+  "canyon": "dense",
+  "policy": "randpersist",
+  "rep": 15,
+  "same": true
+ },
+ {
+  "study": "primary",
+  "canyon": "suburban",
+  "policy": "multisat",
+  "rep": 13,
+  "same": true
+ },
+ {
+  "study": "primary",
+  "canyon": "urban",
+  "policy": "blindbest",
+  "rep": 14,
+  "same": true
+ },
+ {
+  "study": "mob",
+  "canyon": "dense",
+  "policy": "relay",
+  "rep": 16,
+  "same": true
+ },
+ {
+  "study": "setup",
+  "canyon": "urban",
+  "policy": "blindlb",
+  "rep": 15,
+  "same": true
+ },
+ {
+  "study": "real",
+  "canyon": "real",
+  "policy": "anyfwd",
+  "rep": 10,
+  "same": true
+ },
+ {
+  "study": "cap",
+  "canyon": "dense",
+  "policy": "multisat",
+  "rep": 15,
+  "same": true
+ }
+]
