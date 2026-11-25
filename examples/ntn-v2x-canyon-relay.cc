@@ -82,9 +82,12 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <cstdio>
 #include <sstream>
+#include <string>
+#include <vector>
 
 using namespace ns3;
 
@@ -866,6 +869,11 @@ ServerRx(uint16_t via, Ptr<Socket> s)
 class CanyonVehicleMobility : public MobilityModel
 {
   public:
+    Ptr<MobilityModel> Copy() const override
+    {
+        return CreateObject<CanyonVehicleMobility>(*this);
+    }
+
     static TypeId GetTypeId()
     {
         static TypeId tid = TypeId("ns3::CanyonVehicleMobility")
@@ -1428,6 +1436,42 @@ main(int argc, char* argv[])
     std::cout << " out=" << out << "\n";
     g_out.close();
     WritePrrType1(out, ch);
+    // ntn-dataset@1 record next to the output CSV (the run directory by default); the NR
+    // check below writes its own record into its subdirectory.
+    {
+        auto num = [](double v) {
+            std::ostringstream o;
+            o << std::setprecision(6) << v;
+            return o.str();
+        };
+        std::vector<ns3::ntnobs::DatasetMetric> metrics = {
+            {"vehicles", std::to_string(nVeh), "config"},
+            {"satellites", std::to_string(g_sats.size()), "config"},
+            {"policy", g_policy, "config"},
+            {"generated", std::to_string(gen), "measured"},
+            {"sent_direct", std::to_string(direct), "measured"},
+            {"relay_asked", std::to_string(asked), "measured"},
+            {"relayed", std::to_string(relayed), "measured"},
+            {"blocked_gen", std::to_string(blockedGen), "measured"},
+            {"ul_sent", std::to_string(g_ulSent), "measured"},
+            {"ul_drop_queue", std::to_string(g_ulDropQ), "measured"},
+            {"ul_drop_los", std::to_string(g_ulDropLos), "measured"},
+            {"ul_wait_ms", num(g_ulSent ? 1e3 * g_ulWaitSum / g_ulSent : 0.0), "measured"}};
+        for (double r : {20.0, 50.0, 100.0, 150.0, 200.0, 300.0})
+        {
+            metrics.push_back({"prr_" + std::to_string(static_cast<int>(r)) + "m",
+                               num(ch->GetPrrWithinRange(r)),
+                               "measured"});
+        }
+        const std::string outDir = std::filesystem::path(out).parent_path().string();
+        ns3::ntnobs::WriteDatasetRecord(outDir.empty() ? "." : outDir,
+                                        "ntn-v2x-canyon-relay",
+                                        "measured",
+                                        argc,
+                                        argv,
+                                        metrics,
+                                        {{"output_csv", out}});
+    }
     Simulator::Destroy();
     if (nrCheckS > 0.0)
     {
